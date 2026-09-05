@@ -3,7 +3,8 @@
 // del OTA_TOKEN (ese solo sube firmware). Las features nuevas (preguntar al
 // libro, recordatorios, voz) se montan acá adentro y heredan el chequeo.
 import { Hono } from "hono";
-
+import { ask } from "./ask";
+api.route("/ask", ask);
 const TOKEN = process.env.DEVICE_TOKEN ?? "";
 
 export const api = new Hono();
