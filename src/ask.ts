@@ -7,19 +7,25 @@
 //     text     = texto plano del capítulo leído hasta acá (el aparato manda las
 //                últimas páginas, ~24 KB como mucho)
 //     page     = texto de la página en la que está el lector (opcional)
-//     question = pregunta del lector
+//     question = pregunta del lector (ya transcripta si vino por voz)
 //     lang     = "es" (default) | "en"
 //   200: { ok: true, answer, model, usage: { input, output, cached } }
 //   4xx/5xx: { ok: false, error }
 //
+// Modelo: claude-haiku-4-5 por defecto (el más barato: $1 / $5 por millón de
+// tokens). ASK_MODEL lo cambia; el pedido no usa parámetros específicos de un
+// modelo, así que cualquier ID actual sirve tal cual.
+//
 // El capítulo va en el system prompt con cache_control: las preguntas
 // sucesivas sobre el mismo capítulo reusan el prefijo cacheado (~90 % menos
-// tokens de entrada). La pregunta va en el mensaje del usuario, después.
+// tokens de entrada). La pregunta y la página actual van en el mensaje del
+// usuario, después.
 import { Hono } from "hono";
 import Anthropic from "@anthropic-ai/sdk";
 
-const MODEL = process.env.ASK_MODEL ?? "claude-opus-5";
+const MODEL = process.env.ASK_MODEL ?? "claude-haiku-4-5";
 const MAX_TEXT = 32_000; // chars; el aparato recorta antes, esto es defensa
+const MAX_PAGE = 8_000;
 const MAX_QUESTION = 500;
 
 const client = new Anthropic();
@@ -34,6 +40,8 @@ function systemPrompt(book: string, chapter: string, lang: string): string {
     "Respondé SOLO con lo que aparece en el texto adjunto y lo que el lector ya leyó; no adelantes nada",
     "de lo que pasa después en la obra aunque la conozcas (sin spoilers). Si el texto no alcanza para",
     "responder, decilo en una línea.",
+    "La pregunta llega transcripta de voz: puede traer errores de reconocimiento; interpretala con",
+    "sentido común y no comentes la transcripción.",
     `Idioma: ${language}. Texto plano, sin markdown, sin títulos ni listas con viñetas.`,
     "La pantalla es chica: máximo 120 palabras salvo que el lector pida algo más largo.",
   ].join(" ");
@@ -49,22 +57,15 @@ ask.post("/", async (c) => {
   const book = (body.book ?? "").toString().slice(0, 200);
   const chapter = (body.chapter ?? "").toString().slice(0, 200);
   const text = (body.text ?? "").toString().slice(0, MAX_TEXT);
-  const page = (body.page ?? "").toString().slice(0, 8_000);
+  const page = (body.page ?? "").toString().slice(0, MAX_PAGE);
   const question = (body.question ?? "").toString().trim().slice(0, MAX_QUESTION);
   const lang = body.lang === "en" ? "en" : "es";
   if (!text || !question) return c.json({ ok: false, error: "text and question are required" }, 400);
 
   try {
-    const response = await client.beta.messages.create({
+    const response = await client.messages.create({
       model: MODEL,
       max_tokens: 1024,
-      // Opus 5 piensa por defecto (adaptive); "medium" alcanza para Q&A sobre
-      // un capítulo y baja el costo respecto del default "high".
-      output_config: { effort: "medium" },
-      // Si un clasificador de seguridad rechaza el pedido, la API lo reintenta
-      // sola en un modelo alternativo dentro de la misma llamada.
-      betas: ["server-side-fallback-2026-07-01"],
-      fallbacks: "default",
       system: [
         { type: "text", text: systemPrompt(book, chapter, lang) },
         {
@@ -73,8 +74,6 @@ ask.post("/", async (c) => {
           cache_control: { type: "ephemeral" },
         },
       ],
-      // La página actual va con la pregunta (cambia a cada rato; el prefijo
-      // cacheado es el texto largo de arriba).
       messages: [
         {
           role: "user",
@@ -86,7 +85,7 @@ ask.post("/", async (c) => {
     });
 
     if (response.stop_reason === "refusal") {
-      return c.json({ ok: false, error: "refused", detail: response.stop_details?.explanation ?? null }, 422);
+      return c.json({ ok: false, error: "refused" }, 422);
     }
     let answer = "";
     for (const block of response.content) {
